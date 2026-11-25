@@ -47,15 +47,41 @@ function api(params) {
   });
 }
 
+/* Read-only pages keep their last good answer on the phone, so the app opens and
+   shows the last synced data with no internet. (Person details are never kept:
+   they hold private sign-up data.) */
+var CACHED_READS = { bootstrap: 1, week: 1, history: 1, halls: 1 };
+function readKey(params) {
+  var o = {};
+  Object.keys(params).sort().forEach(function (k) { if (k !== 'token' && k !== 'callback') o[k] = params[k]; });
+  return 'wes_c_' + JSON.stringify(o);
+}
+function clearReadCache() {
+  Object.keys(localStorage).forEach(function (k) { if (k.indexOf('wes_c_') === 0 || k.indexOf('wes_week_') === 0) localStorage.removeItem(k); });
+}
+
 function call(params) {
   if (state.token && !params.token) params.token = state.token;
+  var ck = CACHED_READS[params.action] && !DEMO ? readKey(params) : null;
   return api(params).then(function (r) {
+    if (ck && r && r.ok === true) {
+      state.offline = false;
+      try { localStorage.setItem(ck, JSON.stringify(r)); } catch (e) {}
+      renderSyncPill();
+    }
     if (!r || r.ok !== true) {
       var msg = (r && r.error) || 'Something went wrong.';
       if (/log in|Session expired|access was removed/i.test(msg)) { logoutLocal(); }
       throw new Error(msg);
     }
     return r;
+  }, function (e) { throw e; }).catch(function (e) {
+    if (ck && isOfflineErr(e)) {
+      var saved = null;
+      try { saved = JSON.parse(localStorage.getItem(ck) || 'null'); } catch (e2) {}
+      if (saved) { state.offline = true; renderSyncPill(); return saved; }
+    }
+    throw e;
   });
 }
 
@@ -120,7 +146,11 @@ function renderSyncPill() {
   var pill = document.getElementById('syncpill');
   if (!pill) return;
   var n = (typeof WESOutbox !== 'undefined') ? WESOutbox.count() : 0;
-  if (flushing && n) {
+  if (state.offline && !n) {
+    pill.style.display = '';
+    pill.textContent = 'Offline \u00b7 last synced data';
+    pill.className = 'syncpill pending';
+  } else if (flushing && n) {
     pill.style.display = '';
     pill.textContent = 'Syncing ' + n + ' mark' + (n > 1 ? 's' : '') + '...';
     pill.className = 'syncpill syncing';
@@ -134,7 +164,10 @@ function renderSyncPill() {
 }
 
 if (typeof window !== 'undefined') {
-  window.addEventListener('online', function () { flushOutbox(); });
+  window.addEventListener('online', function () {
+    flushOutbox();
+    if (state.offline && state.token) { state.boot = null; render(); } // back online: load fresh data
+  });
   setInterval(function () { flushOutbox(); }, 30000);
 }
 
@@ -181,6 +214,7 @@ var I = {
   shield: '<svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.5 3 8.2 7 10 4-1.8 7-5.5 7-10V6z"/><path d="m9 11.5 2.2 2.2L15.5 9"/></svg>',
   search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg>',
   plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  pin: '<svg viewBox="0 0 24 24"><path d="M12 21s7-5.6 7-11a7 7 0 1 0-14 0c0 5.4 7 11 7 11z"/><circle cx="12" cy="10" r="2.6"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2m-8 0 1 13h8l1-13"/></svg>',
   left: '<svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg>',
   right: '<svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>',
@@ -209,7 +243,8 @@ function shell(title, bodyHtml, activeNav) {
     ['members', '#/members', I.users, 'Members'],
     ['attendance', '#/attendance', I.check, 'Take attendance'],
     ['history', '#/history', I.hist, 'Attendance history'],
-    ['followup', '#/followup', I.flag, 'Needs follow-up']
+    ['followup', '#/followup', I.flag, 'Needs follow-up'],
+    ['halls', '#/halls', I.pin, 'Halls \u00b7 \u0642\u0627\u0639\u0627\u062a']
   ];
   if (me.role === 'admin') nav.push(['admins', '#/admins', I.shield, 'Admins and leaders']);
   var navHtml = nav.map(function (n) {
@@ -246,6 +281,7 @@ function shell(title, bodyHtml, activeNav) {
 function logoutLocal() {
   state.token = ''; state.me = null; state.boot = null; state.week = null; state.person = null; state.hist = null;
   localStorage.removeItem('wes_token');
+  clearReadCache();
 }
 
 /* ---------------- login ---------------- */
@@ -309,6 +345,25 @@ function loginView(step, email) {
 
 /* ---------------- home ---------------- */
 
+function bdayCard(list) {
+  if (!list || !list.length) return '';
+  var rows = list.map(function (x) {
+    var when = x.inDays === 0 ? '<span class="badge green">Today</span>'
+      : '<span class="badge">' + (x.inDays === 1 ? 'Tomorrow' : 'In ' + x.inDays + ' days') + '</span>';
+    return '<div class="listrow" data-go="#/person/' + esc(x.id) + '"><div><div class="nm">&#127874; ' + da(x.name) + '</div>' +
+      '<div class="tm">' + da(x.team) + ' &middot; turns ' + x.turns + (x.inDays ? ' on ' + fmtDate(x.date) : '') + '</div></div>' + when + '</div>';
+  }).join('');
+  var today = list.filter(function (x) { return x.inDays === 0; });
+  if (today.length) {
+    var day = new Date().toISOString().slice(0, 10);
+    if (localStorage.getItem('wes_bday_seen') !== day) {
+      localStorage.setItem('wes_bday_seen', day);
+      setTimeout(function () { toast('\ud83c\udf82 Birthday today: ' + today.map(function (x) { return x.name; }).join(', ')); }, 400);
+    }
+  }
+  return '<div class="card"><h3>Birthdays this week</h3>' + rows + '</div>';
+}
+
 function homeView() {
   var b = state.boot;
   var s = b.stats;
@@ -339,6 +394,7 @@ function homeView() {
     : '<div class="sub" style="margin:6px 0 0">No members are flagged.</div>';
 
   shell('Home',
+    bdayCard(b.birthdays) +
     '<a class="btn green block big" href="#/attendance" style="margin:6px 0 16px">Take attendance</a>' +
     '<div class="statgrid">' +
       '<div class="stat"><div class="t">Members</div><div class="n">' + s.members + '</div><div class="d">On your list</div></div>' +
@@ -483,8 +539,27 @@ function personView(id) {
         row('Owns the scout shirt', d.uniformShirt) + row('Owns the summer t-shirt', d.uniformTshirt) +
         row('Personal photo', d.photoUrl, true) + row('Birth certificate', d.birthCertUrl, true) +
       '</div></div>' +
-      '<div class="card"><h3>Recent attendance</h3>' + (marks || '<div class="sub" style="margin:8px 0 0">No marks yet.</div>') + '</div>',
+      '<div class="card"><h3>Recent attendance</h3>' + (marks || '<div class="sub" style="margin:8px 0 0">No marks yet.</div>') + '</div>' +
+      (state.me && state.me.role === 'admin'
+        ? '<div class="card" id="rmCard"><h3>Remove from the app</h3>' +
+          '<p class="hint">Hides this person from every list in the app. Nothing is deleted from your Sheet or the sign-up form, and their attendance history stays. You can bring them back from the Admins page.</p>' +
+          '<div id="rmSlot"><button class="btn danger-text" id="rmBtn" style="padding-left:0">' + I.trash + ' Remove ' + da(m.name) + ' from the app</button></div></div>'
+        : ''),
       'members');
+    var rmBtn = $('#rmBtn');
+    if (rmBtn) rmBtn.onclick = function () {
+      $('#rmSlot').innerHTML =
+        '<div class="err" style="margin-bottom:10px">Remove <b>' + da(m.name) + '</b> from the app?</div>' +
+        '<div class="btnrow"><button class="btn danger" id="rmYes">Yes, remove</button><button class="btn" id="rmNo">Cancel</button></div>';
+      $('#rmNo').onclick = function () { personView(id); };
+      $('#rmYes').onclick = function () {
+        setBusy(true);
+        call({ action: 'archive', memberId: m.id })
+          .then(function () { toast('Removed from the app.'); return refreshBoot(); })
+          .then(function () { setBusy(false); go('#/members'); render(); })
+          .catch(handleErr);
+      };
+    };
   }).catch(function (e) {
     shell('Member', '<div class="err">' + esc(e.message) + '</div>', 'members');
   });
@@ -782,6 +857,23 @@ function adminsView() {
       '<input class="input" id="newteamemail" type="email" placeholder="Leader email" dir="ltr">' +
       '<button class="btn green block" id="addNewTeam">' + I.userplus + ' Add</button></div>' +
     teamCards +
+    ((b.duplicates && b.duplicates.length)
+      ? '<div class="card"><h3>Possible duplicates</h3><p class="hint">These look like the same person (same valid ID in the sign-up form). Open the extra one and use Remove from the app. Nothing is removed automatically.</p>' +
+        b.duplicates.map(function (g) {
+          return g.map(function (x) {
+            return '<div class="listrow" data-go="#/person/' + esc(x.id) + '"><div><div class="nm" style="font-size:14.5px">' + da(x.name) + '</div>' +
+              '<div class="tm">' + da(x.team) + ' &middot; ' + esc(x.id) + (x.phone ? ' &middot; ' + esc(x.phone) : '') + '</div></div></div>';
+          }).join('') + '<div style="height:10px"></div>';
+        }).join('') + '</div>'
+      : '') +
+    ((b.archived && b.archived.length)
+      ? '<div class="card"><h3>Removed from the app</h3><p class="hint">Hidden everywhere in the app. Still in your Sheet. Restore brings them back.</p>' +
+        b.archived.map(function (a) {
+          return '<div class="listrow" style="cursor:default"><div><div class="nm" style="font-size:14.5px">' + da(a.name) + '</div>' +
+            '<div class="tm">' + da(a.team) + ' &middot; ' + esc(a.id) + '</div></div>' +
+            '<button class="btn" data-restore="' + esc(a.id) + '">Restore</button></div>';
+        }).join('') + '</div>'
+      : '') +
     '<div class="card"><h3>Admins</h3><p class="hint">Admins see every team and member, and manage admins and leaders.</p>' +
       adminRows +
       '<input class="input" id="newadmin" type="email" placeholder="Email" dir="ltr">' +
@@ -790,6 +882,14 @@ function adminsView() {
     'admins');
 
   function after() { return refreshBoot().then(function () { setBusy(false); adminsView(); }); }
+  $$('[data-go]').forEach(function (x) { x.onclick = function () { go(x.getAttribute('data-go')); }; });
+  $$('button[data-restore]').forEach(function (btn) {
+    btn.onclick = function () {
+      setBusy(true);
+      call({ action: 'restore', memberId: btn.getAttribute('data-restore') })
+        .then(function () { toast('Restored.'); }).then(after).catch(handleErr);
+    };
+  });
   $$('button[data-addleader]').forEach(function (btn) {
     btn.onclick = function () {
       var t = btn.getAttribute('data-addleader');
@@ -831,6 +931,134 @@ function adminsView() {
   });
 }
 
+/* ---------------- halls (places and bookings) ---------------- */
+
+var hallDraft = {};          // per place: remembered date / times / team so back-to-back bookings are quick
+var hallsCache = null;
+
+function localYmd(d) {
+  var p = function (n) { return ('0' + n).slice(-2); };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+function nextSaturday() {            // the coming Saturday (today if it is Saturday)
+  var d = new Date();
+  d.setDate(d.getDate() + ((6 - d.getDay() + 7) % 7));
+  return localYmd(d);
+}
+function fmtTime(t) {
+  var m = /^(\d{1,2}):(\d{2})$/.exec(t || '');
+  if (!m) return esc(t || '');
+  var h = parseInt(m[1], 10), ap = h >= 12 ? 'PM' : 'AM';
+  h = h % 12; if (h === 0) h = 12;
+  return h + ':' + m[2] + ' ' + ap;
+}
+function addHour(t) {
+  var m = /^(\d{2}):(\d{2})$/.exec(t || '');
+  if (!m) return '';
+  var h = parseInt(m[1], 10) + 1;
+  return h > 23 ? '23:59' : ('0' + h).slice(-2) + ':' + m[2];
+}
+function fmtDay(d) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d || '');
+  if (!m) return esc(d || '');
+  var days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  return days[new Date(+m[1], +m[2] - 1, +m[3]).getDay()] + ' ' + fmtDate(d);
+}
+
+function hallsView() {
+  shell('Halls', '<div class="center"><span class="spinner"></span></div>', 'halls');
+  call({ action: 'halls' }).then(function (r) {
+    hallsCache = r;
+    var edit = !!r.canEdit;
+    var b = state.boot, teamSet = {};
+    (b.members || []).forEach(function (m) { if (m.team) teamSet[m.team] = 1; });
+    var teamList = '<datalist id="teamlist">' + Object.keys(teamSet).sort().map(function (t) { return '<option value="' + esc(t) + '">'; }).join('') + '</datalist>';
+
+    var cards = r.halls.map(function (h) {
+      var dr = hallDraft[h.id] || (hallDraft[h.id] = { date: nextSaturday(), start: '', end: '', team: '' });
+      var byDate = {}, dates = [];
+      h.slots.forEach(function (sl) { if (!byDate[sl.date]) { byDate[sl.date] = []; dates.push(sl.date); } byDate[sl.date].push(sl); });
+      var list = dates.map(function (d) {
+        return '<div class="teamhead" style="margin:10px 0 2px">' + fmtDay(d) + '</div>' +
+          byDate[d].map(function (sl) {
+            return '<div class="listrow" style="cursor:default"><div><div class="nm" style="font-size:14.5px" dir="ltr">' +
+              fmtTime(sl.start) + ' &ndash; ' + fmtTime(sl.end) + '</div><div class="tm">' + da(sl.team) + '</div></div>' +
+              (edit ? '<button class="iconbtn" data-rslot="' + esc(sl.id) + '" aria-label="Remove booking">' + I.trash + '</button>' : '') + '</div>';
+          }).join('');
+      }).join('');
+      var form = edit
+        ? '<div style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">' +
+            '<label class="f">Date</label><input class="input" type="date" data-f="date" data-h="' + esc(h.id) + '" value="' + esc(dr.date) + '">' +
+            '<div class="filterrow"><div><label class="f">From</label><input class="input" type="time" data-f="start" data-h="' + esc(h.id) + '" value="' + esc(dr.start) + '"></div>' +
+            '<div><label class="f">To</label><input class="input" type="time" data-f="end" data-h="' + esc(h.id) + '" value="' + esc(dr.end) + '"></div></div>' +
+            '<label class="f">Team</label><input class="input" list="teamlist" dir="auto" placeholder="Team name" data-f="team" data-h="' + esc(h.id) + '" value="' + esc(dr.team) + '">' +
+            '<button class="btn green block" data-addslot="' + esc(h.id) + '">' + I.plus + ' Add booking</button></div>'
+        : '';
+      return '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h3>' + da(h.name) + '</h3>' +
+        (edit ? '<button class="iconbtn" data-rhall="' + esc(h.id) + '" data-name="' + esc(h.name) + '" aria-label="Remove place">' + I.trash + '</button>' : '') + '</div>' +
+        (list || '<div class="sub" style="margin:6px 0 0">No upcoming bookings.</div>') + form + '</div>';
+    }).join('');
+
+    shell('Halls',
+      '<h1>Halls &middot; &#1602;&#1575;&#1593;&#1575;&#1578;</h1>' +
+      '<div class="sub">Which team has which place, and when. ' + (edit ? 'Only admins can change this.' : 'Only admins can change this. You can view it.') + '</div>' +
+      (edit
+        ? '<div class="card"><h3>Add place</h3><input class="input" id="newhall" dir="auto" placeholder="Place name (for example Hall 1)">' +
+          '<button class="btn green block" id="addHall">' + I.plus + ' Add place</button></div>'
+        : '') +
+      (cards || '<div class="card"><div class="empty"><div class="t">No places yet</div></div></div>') + teamList,
+      'halls');
+
+    function reload() { setBusy(false); hallsView(); }
+    function readDraft(hid) {
+      var o = {};
+      $$('[data-h="' + hid + '"]').forEach(function (x) { o[x.getAttribute('data-f')] = x.value.trim(); });
+      return o;
+    }
+    $$('[data-h]').forEach(function (x) {      // remember what he typed if the page re-renders
+      x.onchange = function () { hallDraft[x.getAttribute('data-h')] = readDraft(x.getAttribute('data-h')); };
+    });
+    var addHall = $('#addHall');
+    if (addHall) addHall.onclick = function () {
+      var name = $('#newhall').value.trim();
+      if (!name) return toast('Type the place name first.', true);
+      setBusy(true);
+      call({ action: 'addHall', name: name }).then(function () { toast('Place added.'); }).then(reload).catch(handleErr);
+    };
+    $$('button[data-addslot]').forEach(function (btn) {
+      btn.onclick = function () {
+        var hid = btn.getAttribute('data-addslot'), d = readDraft(hid);
+        if (!d.date || !d.start || !d.end || !d.team) return toast('Fill the date, both times and the team.', true);
+        setBusy(true);
+        call({ action: 'addSlot', hallId: hid, date: d.date, start: d.start, end: d.end, team: d.team })
+          .then(function () {
+            toast('Booking added.');
+            // back-to-back: next booking starts when this one ends, same date
+            hallDraft[hid] = { date: d.date, start: d.end, end: addHour(d.end), team: '' };
+          }).then(reload).catch(handleErr);
+      };
+    });
+    $$('button[data-rslot]').forEach(function (btn) {
+      btn.onclick = function () {
+        if (!window.confirm('Remove this booking?')) return;
+        setBusy(true);
+        call({ action: 'deleteSlot', slotId: btn.getAttribute('data-rslot') })
+          .then(function () { toast('Booking removed.'); }).then(reload).catch(handleErr);
+      };
+    });
+    $$('button[data-rhall]').forEach(function (btn) {
+      btn.onclick = function () {
+        if (!window.confirm('Remove "' + btn.getAttribute('data-name') + '" and all its bookings?')) return;
+        setBusy(true);
+        call({ action: 'deleteHall', hallId: btn.getAttribute('data-rhall') })
+          .then(function () { toast('Place removed.'); }).then(reload).catch(handleErr);
+      };
+    });
+  }).catch(function (e) {
+    shell('Halls', '<div class="err">' + esc(e.message) + '</div>', 'halls');
+  });
+}
+
 /* ---------------- boot + router ---------------- */
 
 function refreshBoot() {
@@ -858,6 +1086,7 @@ function render() {
   if (h === '#/attendance') return goWith(attendanceView);
   if (h === '#/history') return goWith(historyView);
   if (h === '#/followup') return goWith(followupView);
+  if (h === '#/halls') return goWith(hallsView);
   if (h === '#/admins') return goWith(function () {
     if (state.me.role !== 'admin') { go('#/home'); return render(); }
     adminsView();
@@ -869,13 +1098,24 @@ window.addEventListener('hashchange', render);
 
 if (DEMO && !state.token) state.token = 'demo';
 
-if ('serviceWorker' in navigator && !DEMO && location.protocol === 'https:') {
+if ('serviceWorker' in navigator && !DEMO && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   navigator.serviceWorker.register('sw.js').catch(function () {});
 }
 
 render();
 
 /* ---------------- demo data (only with ?demo=1, for previews) ---------------- */
+
+var demoArchived = [{ id: 'M-0099', name: 'Demo Removed Person', team: 'براعم', phone: '', by: 'demo@example.com', at: '2026-11-25' }];
+var demoHalls = (function () {
+  var d = new Date(); d.setDate(d.getDate() + ((6 - d.getDay() + 7) % 7));
+  var p = function (n) { return ('0' + n).slice(-2); };
+  var sat = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  return [{ id: 'H-1', name: 'Demo Hall 1', slots: [
+    { id: 'S-1', date: sat, start: '17:00', end: '18:00', team: '\u0628\u0631\u0627\u0639\u0645' },
+    { id: 'S-2', date: sat, start: '18:00', end: '19:00', team: '\u0643\u0634\u0627\u0641\u064a\u0646' }] },
+    { id: 'H-2', name: 'Demo Yard', slots: [] }];
+})();
 
 function demoApi(p) {
   // Synthetic demo data for screenshots and previews only. No real member data here.
@@ -920,7 +1160,9 @@ function demoApi(p) {
         chart: chart, teamCounts: teamCounts, flagged: [],
         members: members,
         admins: [{ email: me.email, name: 'Demo Admin' }],
-        leaders: [{ team: 'براعم', email: 'leader@example.com' }]
+        leaders: [{ team: 'براعم', email: 'leader@example.com' }],
+        archived: demoArchived, duplicates: [[{ id: 'M-0004', name: 'Demo Twin', team: 'قائد', phone: '01000000003' }, { id: 'M-0040', name: 'Demo Twin', team: 'قائد', phone: '0100000' }]],
+        birthdays: [{ id: 'M-0003', name: 'Demo Leader', team: 'براعم', inDays: 0, date: f(today), turns: 12 }, { id: 'M-0005', name: 'عضو تجريبي ثاني', team: 'براعم', inDays: 3, date: f(new Date(today.getTime() + 3 * 864e5)), turns: 10 }]
       });
       if (p.action === 'week') {
         var w = new Date(ws(new Date())); w.setDate(w.getDate() + (parseInt(p.offset, 10) || 0) * 7);
@@ -950,6 +1192,18 @@ function demoApi(p) {
       if (p.action === 'person') {
         var m2 = members.filter(function (x) { return x.id === p.id; })[0];
         return res({ ok: true, member: m2, detail: { email: 'demo@example.com', address: 'Demo address', nationalId: '00000000000000', birthdate: '2010-01-01', church: 'Demo church', school: 'Demo school', schoolYear: 'Demo year', medical: 'لا', uniformShirt: 'نعم', uniformTshirt: 'نعم', fatherPhone: '01000000000', motherPhone: '01000000000', area: 'Demo area' }, marks: [] });
+      }
+      if (p.action === 'restore') { demoArchived.length = 0; return res({ ok: true }); }
+      if (p.action === 'archive') {
+        var ix = -1; members.forEach(function (x, i) { if (x.id === p.memberId) ix = i; });
+        if (ix > -1) members.splice(ix, 1);
+        return res({ ok: true });
+      }
+      if (p.action === 'halls') return res({ ok: true, canEdit: true, today: f(today), halls: demoHalls });
+      if (p.action === 'addHall') { demoHalls.push({ id: 'H-' + demoHalls.length, name: p.name, slots: [] }); return res({ ok: true }); }
+      if (p.action === 'addSlot') {
+        demoHalls.forEach(function (h) { if (h.id === p.hallId) h.slots.push({ id: 'S-' + Math.random(), date: p.date, start: p.start, end: p.end, team: p.team }); });
+        return res({ ok: true });
       }
       return res({ ok: true });
     }, 60);

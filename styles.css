@@ -211,3 +211,5 @@ label.f{display:block;color:var(--muted);font-size:13px;margin:10px 0 5px}
 .syncpill.pending{background:#3a2f12;color:#f5c76a;border:1px solid #6b5620}
 .syncpill.syncing{background:#0f2d1f;color:#5dd39e;border:1px solid #1f5c40}
 .offlinebanner{background:#3a2f12;border:1px solid #6b5620;color:#f5c76a;border-radius:12px;padding:10px 14px;font-size:13px;margin-bottom:12px}
+.btn.danger{background:var(--red);border-color:var(--red);color:#fff}
+input[type=date].input,input[type=time].input{color-scheme:dark}
